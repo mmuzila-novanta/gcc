@@ -619,6 +619,9 @@ struct mips_cpu_info {
 									\
       if (TARGET_CACHE_BUILTIN)						\
 	builtin_define ("__GCC_HAVE_BUILTIN_MIPS_CACHE");		\
+									\
+      if (TARGET_COMPACT_EH)						\
+	builtin_define ("__GNU_COMPACT_EH__");				\
     }									\
   while (0)
 
@@ -887,6 +890,9 @@ struct mips_cpu_info {
 #define ABI_HAS_64BIT_SYMBOLS	(FILE_HAS_64BIT_SYMBOLS \
 				 && Pmode == DImode	\
 				 && !TARGET_SYM32)
+
+/* True if Compact EH supports the ABI.  */
+#define ABI_HAS_COMPACT_EH_SUPPORT (mips_abi == ABI_32 || TARGET_NEWABI)
 
 /* ISA has instructions for managing 64-bit fp and gp regs (e.g. mips3).  */
 #define ISA_HAS_64BIT_REGS	(ISA_MIPS3				\
@@ -2821,11 +2827,12 @@ while (0)
 /* This is how to declare a function name.  The actual work of
    emitting the label is moved to function_prologue, so that we can
    get the line number correctly emitted before the .ent directive,
-   and after any .file directives.  Define as empty so that the function
-   is not declared before the .ent directive elsewhere.  */
+   and after any .file directives.  Define as mostly empty so that the
+   function is not declared before the .ent directive elsewhere.  */
 
 #undef ASM_DECLARE_FUNCTION_NAME
-#define ASM_DECLARE_FUNCTION_NAME(STREAM,NAME,DECL)
+#define ASM_DECLARE_FUNCTION_NAME(STREAM,NAME,DECL) \
+  mips_fixup_cfi_sections ();
 
 /* This is how to store into the string LABEL
    the symbol_ref name of an internal numbered label where
@@ -3312,9 +3319,41 @@ struct GTY(())  machine_function {
    versions of the linker know how to do this for indirect pointers,
    and for personality data.  We must fall back on using writable
    .eh_frame sections for shared libraries if the linker does not
-   support this feature.  */
+   support this feature.
+   
+   For compact EH frames we have a special relocation we can use.  */
+
+#define MIPS_COMPACT_EH_PCREL 1
+
+#define MIPS_COMPACT_EH_ENCODING (DW_EH_PE_pcrel | DW_EH_PE_sdata4)
+
 #define ASM_PREFERRED_EH_DATA_FORMAT(CODE,GLOBAL) \
-  (((GLOBAL) ? DW_EH_PE_indirect : 0) | DW_EH_PE_absptr)
+  (TARGET_COMPACT_EH \
+   ? MIPS_COMPACT_EH_ENCODING \
+   : (((GLOBAL) ? DW_EH_PE_indirect : 0) | DW_EH_PE_absptr))
+
+/* Handle special EH pointer encodings.  */
+
+#define ASM_MAYBE_OUTPUT_ENCODED_ADDR_RTX(FILE, ENCODING, SIZE, ADDR, DONE) \
+  do {									\
+    if ((SIZE) == 4 && (ENCODING) == MIPS_EH_ENCODING)			\
+      {									\
+        fputs ("\t.ehword\t", FILE);					\
+        assemble_name (FILE, XSTR (ADDR, 0));				\
+        goto DONE;							\
+      }									\
+  } while (0)
+
+#define MIPS_EH_ENCODING \
+  (DW_EH_PE_datarel | DW_EH_PE_sdata4 | DW_EH_PE_indirect)
+
+#define md_unwind_compact_opcode_finish 0x5c
+
+#define CRT_GET_RFIB_DATA(BASE)			\
+  {						\
+    extern char _gp[];				\
+    BASE = &_gp[0];				\
+  }
 
 /* For switching between MIPS16 and non-MIPS16 modes.  */
 #define SWITCHABLE_TARGET 1

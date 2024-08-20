@@ -61,6 +61,8 @@ along with GCC; see the file COPYING3.  If not see
 #include "context.h"
 #include "builtins.h"
 #include "rtl-iter.h"
+#include "except.h"
+#include "debug.h"
 
 /* This file should be included last.  */
 #include "target-def.h"
@@ -530,6 +532,8 @@ static int cached_can_issue_more;
 static mips_one_only_stub *mips16_rdhwr_stub;
 static mips_one_only_stub *mips16_get_fcsr_stub;
 static mips_one_only_stub *mips16_set_fcsr_stub;
+
+static bool done_cfi_sections;
 
 /* Index R is the smallest register class that contains register R.  */
 const enum reg_class mips_regno_to_class[FIRST_PSEUDO_REGISTER] = {
@@ -6528,6 +6532,41 @@ mips_start_unique_function (const char *name)
   putc ('\n', asm_out_file);
 }
 
+/* The LTO frontend only enables exceptions when it sees a function that
+   uses it.  This changes the return value of dwarf2out_do_frame, so we
+   have to check before every function.  */
+
+void
+mips_fixup_cfi_sections (void)
+{
+#ifdef MD_HAVE_COMPACT_EH
+  if (done_cfi_sections)
+    return;
+
+  if (!TARGET_COMPACT_EH)
+    return;
+
+  /* Output a .cfi_sections directive.  */
+  if (dwarf2out_do_frame ())
+    {
+      if (flag_unwind_tables || flag_exceptions)
+	{
+	  if (write_symbols == DWARF2_DEBUG
+	      || write_symbols == VMS_AND_DWARF2_DEBUG
+	      || flag_asynchronous_unwind_tables)
+	    fprintf (asm_out_file,
+		     "\t.cfi_sections .debug_frame, .eh_frame_entry\n");
+	  else
+	    fprintf (asm_out_file, "\t.cfi_sections .eh_frame_entry\n");
+	}
+      else
+	fprintf (asm_out_file, "\t.cfi_sections .debug_frame\n");
+      done_cfi_sections = true;
+    }
+#endif
+}
+
+
 /* Start a definition of function NAME.  MIPS16_P indicates whether the
    function contains MIPS16 code.  */
 
@@ -7111,7 +7150,11 @@ mips16_build_call_stub (rtx retval, rtx *fn_ptr, rtx args_size, int fp_code)
 
 	  /* "Save" $sp in itself so we don't use the fake CFA.
 	     This is: DW_CFA_val_expression r29, { DW_OP_reg29 }.  */
-	  fprintf (asm_out_file, "\t.cfi_escape 0x16,29,1,0x6d\n");
+	  if (dwarf2out_do_frame ()
+	      && (flag_unwind_tables || flag_exceptions))
+	    fprintf (asm_out_file, "\t.cfi_fde_data 0x5b\n");
+	  else
+	    fprintf (asm_out_file, "\t.cfi_escape 0x16,29,1,0x6d\n");
 
 	  /* Save the return address in $18.  The stub's caller knows
 	     that $18 might be clobbered, even though $18 is usually
@@ -8723,6 +8766,19 @@ mips_function_rodata_section (tree decl)
   return data_section;
 }
 
+/* Implement TARGET_ASM_INIT_SECTIONS.  */
+
+static void
+mips_asm_init_sections (void)
+{
+  if (TARGET_COMPACT_EH)
+    {
+      /* Let the assembler decide where to put the LSDA.  */
+      exception_section = get_unnamed_section (0, output_section_asm_op,
+					       "\t.cfi_inline_lsda 2");
+    }
+}
+
 /* Implement TARGET_IN_SMALL_DATA_P.  */
 
 static bool
@@ -8732,6 +8788,13 @@ mips_in_small_data_p (const_tree decl)
 
   if (TREE_CODE (decl) == STRING_CST || TREE_CODE (decl) == FUNCTION_DECL)
     return false;
+
+  /* Place eh-related data in sdata so that we can use a gprel32 reloc
+     to access it.  */
+  if (TARGET_64BIT
+      && TREE_CODE (decl) == VAR_DECL && DECL_NAME (decl)
+      && strncmp (IDENTIFIER_POINTER (DECL_NAME (decl)), "DW.ref.", 7) == 0)
+    return true;
 
   /* We don't yet generate small-data references for -mabicalls
      or VxWorks RTP code.  See the related -G handling in
@@ -9226,6 +9289,8 @@ static void
 mips_file_start (void)
 {
   default_file_start ();
+
+  done_cfi_sections = false;
 
   /* Generate a special section to describe the ABI switches used to
      produce the resultant binary.  */
@@ -12080,6 +12145,175 @@ mips_expand_epilogue (bool sibcall_p)
       emit_insn_before (gen_mips_di (), insn);
       emit_insn_before (gen_mips_ehb (), insn);
     }
+}
+
+/* Add an opcode to *FDE to describe the necessary pushes of r30/r31, if
+   any.  */
+static void
+add_fp_ra_push (vec<uchar, va_gc> **fde)
+{
+  bool fp_needed = BITSET_P (cfun->machine->frame.mask, 30);
+  if (!BITSET_P (cfun->machine->frame.mask, RETURN_ADDR_REGNUM)
+      && !fp_needed)
+    return;
+
+  vec_safe_push (*fde, (uchar) 0x59);
+  if (fp_needed)
+    vec_safe_push (*fde, (uchar) ((30 << 3) | 1));
+  else
+    vec_safe_push (*fde, uchar (31 << 3));
+}
+
+/* Add an opcode to *FDE to describe an adjustment of the CFA register by
+   AMOUNT, given an assumed alignment ALIGN.  */
+static void
+mips_fdedata_cfaadjust (vec <uchar, va_gc> **fde,
+			HOST_WIDE_INT amount, int align)
+{
+  if (amount == 0)
+    return;
+
+  gcc_assert (amount % align == 0);
+  if (amount >= align * 129)
+    {
+      vec_safe_push (*fde, (uchar) 0x58);
+      push_uleb128 (fde, amount / align - 129);
+    }
+  else if (amount >= align * 65)
+    {
+      vec_safe_push (*fde, (uchar) 0x3f);
+      vec_safe_push (*fde, (uchar) (amount / align - 64));
+    }
+  else
+    vec_safe_push (*fde, (uchar) (amount / align - 1));
+}
+
+/* Implements TARGET_ASM_OUTPUT_CFI_ENDPROC.  Emit the .cfi_endproc
+   directive, and when emitting unwind information, also emit the
+   .cfi_fde_data directive.  */
+static void
+mips_cfi_endproc (void)
+{
+  int align = TARGET_NEWABI ? 16 : 8;
+  vec<uchar, va_gc> *fde = NULL;
+  int i, len, n;
+  HOST_WIDE_INT total, push_base;
+  bool any_saved = false;
+
+  if (!TARGET_COMPACT_EH
+      || (!flag_unwind_tables && !flag_exceptions)
+      || flag_asynchronous_unwind_tables)
+    {
+      fprintf (asm_out_file, ".cfi_endproc\n");
+      return;
+    }
+
+  fprintf (asm_out_file, "\t.cfi_fde_data ");
+
+  total = cfun->machine->frame.total_size;
+  if (cfun->machine->frame.num_fp > 0)
+    push_base = cfun->machine->frame.fp_sp_offset + UNITS_PER_HWFPVALUE;
+  else if (cfun->machine->frame.num_gp > 0)
+    push_base = cfun->machine->frame.gp_sp_offset + UNITS_PER_WORD;
+  else
+    push_base = total;
+
+  if (frame_pointer_needed)
+    {
+      if (HARD_FRAME_POINTER_REGNUM == 30)
+	vec_safe_push (fde, (uchar) 0x5E);
+      else
+	{
+	  int t = HARD_FRAME_POINTER_REGNUM - 16;
+	  gcc_assert (t < 8);
+	  vec_safe_push (fde, (uchar) (0x50 + t));
+	}
+      total -= cfun->machine->frame.hard_frame_pointer_offset;
+      push_base -= cfun->machine->frame.hard_frame_pointer_offset;
+    }
+
+  if (HARD_FRAME_POINTER_REGNUM == 30 && frame_pointer_needed)
+    gcc_assert (BITSET_P (cfun->machine->frame.mask, 30));
+
+  mips_fdedata_cfaadjust (&fde, push_base, align);
+  total -= push_base;
+
+  n = 0;
+  for (i = 31; i > 19; i--)
+    {
+      bool isset = BITSET_P (cfun->machine->frame.fmask, i);
+      if (isset)
+	n++;
+      if ((i == 20 || !isset) && n > 0)
+	{
+	  int first = i + (isset ? 0 : 1);
+	  if (first == 20)
+	    {
+	      if (n > 8)
+		vec_safe_push (fde, (uchar) (0x68 + n - 9));
+	      else
+		vec_safe_push (fde, (uchar) (0x60 + n - 1));
+	    }
+	  else
+	    {
+	      if (n > 8)
+		{
+		  vec_safe_push (fde, (uchar) 0x5a);
+		  vec_safe_push (fde, (uchar) (((first + 8) << 3) | (n - 9)));
+		  n = 8;
+		}
+	      vec_safe_push (fde, (uchar) 0x5a);
+	      vec_safe_push (fde, (uchar) ((first << 3) | (n - 1)));
+	    }
+	  n = 0;
+	}
+    }
+  gcc_assert (n == 0);
+
+  for (i = 23; i > 0; i--)
+    {
+      bool isset = BITSET_P (cfun->machine->frame.mask, i);
+      if (isset)
+	n++;
+      if ((i == 16 || i == 1 || !isset) && n > 0)
+	{
+	  int first = i + (isset ? 0 : 1);
+	  if (first == 16 && !any_saved
+	      && BITSET_P (cfun->machine->frame.mask, RETURN_ADDR_REGNUM))
+	    {
+	      if (BITSET_P (cfun->machine->frame.mask, 30))
+		vec_safe_push (fde, (uchar) (0x48 + n - 1));
+	      else
+		vec_safe_push (fde, (uchar) (0x40 + n - 1));
+	    }
+	  else
+	    {
+	      if (!any_saved)
+		add_fp_ra_push (&fde);
+	      vec_safe_push (fde, (uchar) 0x59);
+	      vec_safe_push (fde, (uchar) ((first << 3) | (n - 1)));
+	    }
+	  any_saved = true;
+	  n = 0;
+	}
+    }
+  gcc_assert (n == 0);
+
+  if (!any_saved)
+    add_fp_ra_push (&fde);
+
+  /* Skip varargs save area and suchlike.  */
+  mips_fdedata_cfaadjust (&fde, total, align);
+
+  /* The assembler appends a "Finish" opcode for out-of-line entries;
+     the unwind code (uw_frame_state_compact) for inline entries.  */
+
+  len = vec_safe_length (fde);
+  for (i = 0; i < len; i++)
+    fprintf (asm_out_file, "0x%x%s", (*fde)[i],
+	     i + 1 == len ? "" : ",");
+  fputc ('\n', asm_out_file);
+  fprintf (asm_out_file, "\t.cfi_endproc\n");
 }
 
 /* Return nonzero if this function is known to have a null epilogue.
@@ -17731,6 +17965,10 @@ mips_option_override (void)
   SUBTARGET_OVERRIDE_OPTIONS;
 #endif
 
+#if !(defined(MD_HAVE_COMPACT_EH) && defined(HAVE_GAS_EH_FRAME_ENTRY))
+  TARGET_COMPACT_EH = 0;
+#endif
+
   /* MIPS16 and microMIPS cannot coexist.  */
   if (TARGET_MICROMIPS && TARGET_MIPS16)
     error ("unsupported combination: %s", "-mips16 -mmicromips");
@@ -17980,6 +18218,10 @@ mips_option_override (void)
       error ("unsupported combination: %qs %s",
 	     mips_arch_info->name, "-mno-explicit-relocs");
     }
+
+  /* Compact EH is only supported for the o32/n32/n64 ABIs.  */
+  if (TARGET_COMPACT_EH && !ABI_HAS_COMPACT_EH_SUPPORT)
+    TARGET_COMPACT_EH = 0;
 
   /* The effect of -mabicalls isn't defined for the EABI.  */
   if (mips_abi == ABI_EABI && TARGET_ABICALLS)
@@ -19929,6 +20171,8 @@ mips_ira_change_pseudo_allocno_class (int regno, reg_class_t allocno_class)
 #define TARGET_ASM_SELECT_RTX_SECTION mips_select_rtx_section
 #undef TARGET_ASM_FUNCTION_RODATA_SECTION
 #define TARGET_ASM_FUNCTION_RODATA_SECTION mips_function_rodata_section
+#undef TARGET_ASM_INIT_SECTIONS
+#define TARGET_ASM_INIT_SECTIONS mips_asm_init_sections
 
 #undef TARGET_SCHED_INIT
 #define TARGET_SCHED_INIT mips_sched_init
@@ -20138,6 +20382,9 @@ mips_ira_change_pseudo_allocno_class (int regno, reg_class_t allocno_class)
 
 #undef TARGET_ASM_OUTPUT_SOURCE_FILENAME
 #define TARGET_ASM_OUTPUT_SOURCE_FILENAME mips_output_filename
+
+#undef TARGET_OUTPUT_CFI_ENDPROC
+#define TARGET_OUTPUT_CFI_ENDPROC mips_cfi_endproc
 
 #undef TARGET_SHIFT_TRUNCATION_MASK
 #define TARGET_SHIFT_TRUNCATION_MASK mips_shift_truncation_mask

@@ -1961,4 +1961,10 @@ default_optab_supported_p (int, machine_mode, machine_mode, optimization_type)
   return true;
 }
 
+void
+default_asm_output_cfi_endproc (void)
+{
+  fprintf (asm_out_file, "\t.cfi_endproc\n");
+}
+
 #include "gt-targhooks.h"

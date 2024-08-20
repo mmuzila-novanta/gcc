@@ -5094,6 +5094,13 @@ AC_DEFINE_UNQUOTED(LD_COMPRESS_DEBUG_OPTION, "$gcc_cv_ld_compress_debug_option",
 [Define to the linker option to enable compressed debug sections.])
 AC_MSG_RESULT($gcc_cv_ld_compress_debug)
 
+gcc_GAS_CHECK_FEATURE([CFI .eh_frame_entry],
+ gcc_cv_as_eh_frame_entry,
+ ,,
+[	.cfi_sections .eh_frame_entry ],,
+[AC_DEFINE(HAVE_GAS_EH_FRAME_ENTRY, 1,
+[Define if your assembler supports generation of .eh_frame_entry from CFI directives.])])
+
 # --------
 # UNSORTED
 # --------
